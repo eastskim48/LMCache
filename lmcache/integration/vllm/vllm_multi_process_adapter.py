@@ -1707,6 +1707,39 @@ class LMCacheMPWorkerAdapter:
         if event is not None:
             self.retrieve_events[request_id] = event
 
+    def submit_matkv_retrieve_request(
+        self,
+        request_id: str,
+        op: LoadStoreOp,
+        matches: list[Any],
+        event: _IpcEvent | None,
+        cache_salt: str = "",
+        request_configs: dict[str, Any] | None = None,
+    ) -> None:
+        """Synchronously load non-prefix chunks through CacheBlend."""
+        assert op.token_ids is not None
+        key = self._create_key(
+            op.token_ids,
+            op.start,
+            op.end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+            request_configs=request_configs,
+        )
+        transfer_ctx = self.transfer_ctx
+        if transfer_ctx is None or not hasattr(transfer_ctx, "submit_cb_retrieve"):
+            raise RuntimeError(
+                "MatKV requires LMCache-driven transfer with registered KV caches"
+            )
+        future = transfer_ctx.submit_cb_retrieve(
+            key,
+            matches,
+            self.instance_id,
+            self._block_ids_per_group(op),
+            event,
+        )
+        future.result(timeout=self._mq_timeout)
+
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
         self,

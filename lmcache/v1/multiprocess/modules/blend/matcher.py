@@ -13,18 +13,15 @@ from lmcache.v1.multiprocess.custom_types import CBMatchResult
 from lmcache.v1.multiprocess.token_hasher import (
     chunk_hash_windows_numba,
     rolling_hash_windows_numba,
-    update_table_id_numba,
 )
 
 logger = init_logger(__name__)
 
 
 class BlendTokenRangeMatcher:
-    """Fingerprint matcher: token-level probe (any offset) + full-hash
-    collision rejection over a direct-address table of chunk poly-hashes."""
+    """Fingerprint matcher: token-level probe at any offset."""
 
-    _TABLE_BITS: int = 20  # 2^20 ~ 1 M entries
-    _TABLE_SIZE: int = 1 << _TABLE_BITS
+    _MAX_CHUNKS: int = 1 << 20
     _BASE: np.uint64 = np.uint64(0x9E3779B97F4A7C15)  # Fibonacci-hashing const
 
     def __init__(self, chunk_size: int = 256, dedup_content: bool = False):
@@ -32,15 +29,14 @@ class BlendTokenRangeMatcher:
         whether to skip registering already-indexed poly hashes."""
         self.chunk_size = chunk_size
         self._dedup_content = dedup_content
-        # poly_chunk_hash -> compact_chunk_id; -1 = empty
-        self._table_id = np.full(self._TABLE_SIZE, -1, dtype=np.int64)
-        self._mask = np.uint64(self._TABLE_SIZE - 1)
+        # Full poly hash -> compact chunk ID. A dictionary is required here:
+        # a single-slot direct-address table loses the older entry whenever
+        # two full hashes share their low bits, causing deterministic misses.
+        self._poly_hash_to_compact_id: dict[int, int] = {}
         # compact_chunk_id -> caller token_hash (full bytes); None once evicted
         self._chunk_token_hash: list[bytes | None] = []
         # token_hash -> start position in its registered sequence
         self._token_hash_to_start: dict[bytes, int] = {}
-        # compact_chunk_id -> table slot (reverse lookup for eviction)
-        self._compact_id_to_slot = np.full(self._TABLE_SIZE, -1, dtype=np.int64)
         # token_hash -> compact_chunk_id (for eviction lookup)
         self._token_hash_to_compact_id: dict[bytes, int] = {}
         self._lock = threading.Lock()
@@ -94,51 +90,54 @@ class BlendTokenRangeMatcher:
             new_chunk_hashes = chunk_hashes[new_idxs]
 
             base_id = len(self._chunk_token_hash)
-            if base_id + n_new > self._TABLE_SIZE:
+            if base_id + n_new > self._MAX_CHUNKS:
                 logger.error(
                     "BlendTokenRangeMatcher compact-ID overflow: %d chunks "
                     "registered, cannot add %d more (limit %d). Skipping.",
                     base_id,
                     n_new,
-                    self._TABLE_SIZE,
+                    self._MAX_CHUNKS,
                 )
                 return 0
-            if base_id + n_new > int(self._TABLE_SIZE * 0.8):
+            if base_id + n_new > int(self._MAX_CHUNKS * 0.8):
                 logger.warning(
                     "BlendTokenRangeMatcher nearing capacity: %d/%d "
-                    "compact IDs used. Hash collision rate is rising; "
-                    "hit rate will degrade.",
+                    "compact IDs used.",
                     base_id + n_new,
-                    self._TABLE_SIZE,
+                    self._MAX_CHUNKS,
                 )
             compact_ids = np.arange(base_id, base_id + n_new, dtype=np.int64)
-
-            update_table_id_numba(new_chunk_hashes, self._table_id, compact_ids)
 
             for k, orig_i in enumerate(new_idxs):
                 th = token_hashes[orig_i]
                 cid = int(compact_ids[k])
                 poly_hash = int(new_chunk_hashes[k])
-                slot = poly_hash & int(self._mask)
                 self._chunk_token_hash.append(th)
                 self._chunk_poly_hash.append(poly_hash)
+                self._poly_hash_to_compact_id[poly_hash] = cid
                 self._token_hash_to_start[th] = (
                     position_offset + orig_i * self.chunk_size
                 )
-                self._compact_id_to_slot[cid] = slot
                 self._token_hash_to_compact_id[th] = cid
         return n_new
 
     def _poly_hash_registered(self, poly_hash: int) -> bool:
-        """Whether a live chunk with this poly hash is indexed (bucket-only
-        collisions report False). Caller must hold ``self._lock``."""
-        cid = int(self._table_id[poly_hash & int(self._mask)])
-        if cid < 0:
+        """Whether a live chunk with this poly hash is indexed.
+
+        Caller must hold ``self._lock``.
+        """
+        cid = self._poly_hash_to_compact_id.get(poly_hash)
+        if cid is None:
             return False
         return (
             self._chunk_poly_hash[cid] == poly_hash
             and self._chunk_token_hash[cid] is not None
         )
+
+    def registered_count(self) -> int:
+        """Return the number of live token-hash fingerprints."""
+        with self._lock:
+            return len(self._token_hash_to_compact_id)
 
     def match_sub_sequence(
         self,
@@ -146,13 +145,13 @@ class BlendTokenRangeMatcher:
     ) -> list[CBMatchResult]:
         """Find every registered chunk reused anywhere in a query sequence.
 
-        Vectorized direct-address probe over all token positions, then a
-        full poly-hash verify that rejects bucket collisions. Thread-safe.
+        Compute rolling hashes for all token positions, then probe the
+        full-hash index. Thread-safe.
 
         Returns:
-            One result per unique reused chunk (cur_st = first query
-            position, old_st = stored position); empty if the query is
-            shorter than one chunk or nothing matched.
+            One result per matching query position (the same stored chunk may
+            appear more than once); empty if the query is shorter than one
+            chunk or nothing matched.
         """
         if len(token_ids) < self.chunk_size:
             return []
@@ -164,28 +163,19 @@ class BlendTokenRangeMatcher:
             if not self._chunk_token_hash:
                 return []
 
-            # Vectorized direct-address probe over all positions. The table is
-            # sparse (TABLE_SIZE >> registered chunks), so only true matches and
-            # a few bucket collisions reach the Python verify loop below.
-            cids_at_pos = self._table_id[rolling & self._mask]
-            hit_positions = np.nonzero(cids_at_pos >= 0)[0]
-
-            seen_cids: set[int] = set()
             results: list[CBMatchResult] = []
-            for pos in hit_positions:
-                pos = int(pos)
-                cid = int(cids_at_pos[pos])
-                if cid in seen_cids:
+            table_hits = 0
+            for pos, poly_hash_value in enumerate(rolling):
+                cid = self._poly_hash_to_compact_id.get(int(poly_hash_value))
+                if cid is None:
                     continue
-                if int(rolling[pos]) != self._chunk_poly_hash[cid]:
-                    continue  # bucket-only collision
+                table_hits += 1
                 th = self._chunk_token_hash[cid]
                 if th is None:
                     continue  # evicted
                 old_st = self._token_hash_to_start.get(th)
                 if old_st is None:
                     continue
-                seen_cids.add(cid)
                 results.append(
                     CBMatchResult(
                         old_st=old_st,
@@ -198,7 +188,7 @@ class BlendTokenRangeMatcher:
             logger.info(
                 "[match_probe] n_tok=%d table_hits=%d matches=%d",
                 len(token_ids),
-                len(hit_positions),
+                table_hits,
                 len(results),
             )
             return results
@@ -211,16 +201,9 @@ class BlendTokenRangeMatcher:
                 cid = self._token_hash_to_compact_id.get(th)
                 if cid is None:
                     continue
-                slot = int(self._compact_id_to_slot[cid])
-                if slot < 0:
-                    logger.warning(
-                        "compact_id %d has no valid table slot; "
-                        "entry may have been evicted twice",
-                        cid,
-                    )
-                    continue
-                self._table_id[slot] = -1
-                self._compact_id_to_slot[cid] = -1
+                poly_hash = self._chunk_poly_hash[cid]
+                if self._poly_hash_to_compact_id.get(poly_hash) == cid:
+                    del self._poly_hash_to_compact_id[poly_hash]
                 self._chunk_token_hash[cid] = None
                 self._chunk_poly_hash[cid] = 0
                 self._token_hash_to_start.pop(th, None)

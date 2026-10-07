@@ -230,14 +230,11 @@ def match_strided(
 
         results: list[CBMatchResult] = []
         seen_cids: set[int] = set()
-        mask = int(matcher._mask)
         for q_pos in range(start_pos, n_positions, stride):
             r = int(rolling[q_pos])
-            cid = int(matcher._table_id[r & mask])
-            if cid < 0 or cid in seen_cids:
+            cid = matcher._poly_hash_to_compact_id.get(r)
+            if cid is None or cid in seen_cids:
                 continue
-            if r != matcher._chunk_poly_hash[cid]:
-                continue  # bucket collision
             th = matcher._chunk_token_hash[cid]
             if th is None:
                 continue  # evicted
@@ -870,6 +867,38 @@ def test_duplicate_content_registers_twice_by_default():
     matcher.remove_chunks([second])
     assert matcher.match_sub_sequence(_content_chunk(1)) == []
     assert first not in _matched_hashes(matcher, _content_chunk(1))
+
+
+def test_one_cached_chunk_matches_each_repeated_query_position():
+    """Repeated document content must be reusable at every online position."""
+    matcher = BlendTokenRangeMatcher(chunk_size=CHUNK_SIZE)
+    cached_hash = ObjectKey.IntHash2Bytes(101)
+    content = _content_chunk(1)
+    _register_content(matcher, content, [101])
+
+    matches = matcher.match_sub_sequence(content + content)
+
+    assert [m.hash for m in matches] == [cached_hash, cached_hash]
+    assert [m.cur_st for m in matches] == [0, CHUNK_SIZE]
+    assert [m.old_st for m in matches] == [0, 0]
+
+
+def test_full_hash_index_preserves_entries_with_same_low_20_bits():
+    """Entries that collided in the old direct table must both remain."""
+    matcher = BlendTokenRangeMatcher(chunk_size=1)
+    token_a = 1
+    token_b = token_a + (1 << 20)
+    hash_a = ObjectKey.IntHash2Bytes(101)
+    hash_b = ObjectKey.IntHash2Bytes(202)
+
+    assert matcher.on_new_token_hashes([token_a], [hash_a]) == 1
+    assert matcher.on_new_token_hashes([token_b], [hash_b]) == 1
+
+    matches = matcher.match_sub_sequence([token_a, token_b])
+    assert [(match.cur_st, match.hash) for match in matches] == [
+        (0, hash_a),
+        (1, hash_b),
+    ]
 
 
 # -- Enabled ------------------------------------------------------------------

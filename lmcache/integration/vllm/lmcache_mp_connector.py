@@ -585,7 +585,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # Banner from the scheduler role only, so tensor-parallel
             # deployments print it once rather than once per worker.
             print_banner_once(sys.stderr)
-            self.scheduler_adapter = LMCacheMPSchedulerAdapter(
+            self.scheduler_adapter = self.scheduler_adapter_cls(
                 server_urls=server_urls,
                 context=zmq_context,
                 model_name=cache_model_name,
@@ -612,7 +612,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             local_server_url = server_urls[
                 parallel_strategy.vllm_worker_id // ranks_per_node
             ]
-            self.worker_adapter = LMCacheMPWorkerAdapter(
+            self.worker_adapter = self.worker_adapter_cls(
                 server_url=local_server_url,
                 context=zmq_context,
                 model_name=cache_model_name,
@@ -1208,7 +1208,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Args:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
-        metadata = LMCacheMPConnectorMetadata()
+        metadata = self.metadata_cls()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
         self._process_retrieve_requests(metadata)

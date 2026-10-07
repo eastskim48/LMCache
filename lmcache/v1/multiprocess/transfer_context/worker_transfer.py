@@ -639,6 +639,38 @@ class LMCacheDrivenTransferContext(TransferContext):
             event_backend=self._event_backend,
         )
 
+    def submit_cb_retrieve(
+        self,
+        key: Any,
+        matches: list[Any],
+        instance_id: int,
+        block_ids: list[list[int]],
+        event: IPCEvent | None,
+    ) -> MessagingFuture:
+        """Submit a CacheBlend retrieve using the registered device context."""
+        if (
+            self._req_client is None
+            or self._device is None
+            or self._event_backend is None
+        ):
+            raise RuntimeError(
+                "LMCache-driven transfer context is not registered. "
+                "Call register() before submit_cb_retrieve()."
+            )
+        if event is None:
+            raise RuntimeError("LMCache-driven transfer requires an IPC event.")
+        event_ipc_handle = self._event_backend.export_event(event, self._device)
+        return self._req_client.cb_retrieve_pre_computed(
+            key,
+            matches,
+            block_ids,
+            instance_id,
+            event_ipc_handle,
+        ).to_device_future(
+            device=self._device,
+            event_backend=self._event_backend,
+        )
+
     def close(self) -> None:
         """Release the message queue and cached event-backend state."""
         self._req_client = None

@@ -96,8 +96,9 @@ class StoreMixin:
             if not chunk_hashes:
                 return result
             tokens_in_range = list(key.token_ids)[key.start : key.end]
-            # Chunk 0 is owned by the prefix lookup leg; skip its fingerprint.
-            start_chunk_idx = 0 if key.start != 0 else 1
+            # Register chunk 0 so independently warmed content remains
+            # discoverable after it moves away from the prompt prefix.
+            start_chunk_idx = 0
             job: FpJob = (
                 tokens_in_range,
                 chunk_hashes,
@@ -126,8 +127,7 @@ class StoreMixin:
 
     def _drain_fingerprints_sync(self) -> None:
         """Sync-drain pending fingerprint registrations (the async drainer
-        races at low max_tokens). Must not clear ``_pending_fp_hashes`` —
-        only the async drainer owns that."""
+        races at low max_tokens)."""
         while True:
             try:
                 job = self._fingerprint_queue.get_nowait()
@@ -144,6 +144,11 @@ class StoreMixin:
                 self._emit_fingerprints_registered(rid, n_new)
             except Exception:
                 logger.exception("CB fingerprint registration failed (sync drain)")
+            finally:
+                with self._pending_fp_lock:
+                    self._pending_fp_hashes.difference_update(
+                        chunk_hashes[start_chunk_idx:]
+                    )
 
     def _emit_fingerprints_registered(self, rid: str, num_chunks: int) -> None:
         """Publish CB_FINGERPRINTS_REGISTERED for one drained registration job.

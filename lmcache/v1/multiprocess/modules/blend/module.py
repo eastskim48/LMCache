@@ -152,6 +152,9 @@ class BlendModule(
     def report_status(self) -> dict:
         cache_contexts = self._transfer_module.context_entries_snapshot()
 
+        with self._pending_fp_lock:
+            pending_fingerprints = len(self._pending_fp_hashes)
+
         def _meta(iid: int) -> "tuple[str, int] | None":
             entry = cache_contexts.get(iid)
             return (entry.model_name, entry.world_size) if entry is not None else None
@@ -160,6 +163,9 @@ class BlendModule(
             "registered_cb_rope_instances": list(self._cb_rope_state.keys()),
             "cb_rope_meta": {str(iid): _meta(iid) for iid in self._cb_rope_state},
             "active_cb_lookups": len(self._cb_jobs),
+            "registered_fingerprints": self._token_range_matcher.registered_count(),
+            "pending_fingerprints": pending_fingerprints,
+            "fingerprint_queue_size": self._fingerprint_queue.qsize(),
         }
 
     def _release_unretrieved_locks(self, session: Session) -> None:
